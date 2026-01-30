@@ -272,11 +272,11 @@ def read_sheet_data(sheets_service, spreadsheet_id, range_name='A1:Z1000'):
 
 def read_sheet_data_large(sheets_service, spreadsheet_id, sheet_title='Hoja 1'):
     """
-    Lee datos de un Google Sheet grande, leyendo en chunks si es necesario
+    Lee datos de un Google Sheet grande. Chunks de 50k para minimizar llamadas API.
     """
     all_data = []
     start_row = 1
-    chunk_size = 10000  # Leer 10k filas a la vez
+    chunk_size = 50000  # Leer 50k filas a la vez (30k filas = 1 sola llamada)
     
     try:
         while True:
@@ -608,6 +608,102 @@ def create_or_update_usuario_evento(postgres_conn, usuario_id, evento_id, cantid
         postgres_conn.rollback()
         raise e
 
+
+# ---------------------------------------------------------------------------
+# Batch processing: aggregate by user, few DB round-trips, one commit per batch
+# Table audiencia_usuarios_eventos must have UNIQUE(usuario_id, evento_id)
+# ---------------------------------------------------------------------------
+BATCH_SIZE_USERS = 5000
+BATCH_SIZE_USUARIO_EVENTO = 5000
+LOOKUP_CHUNK = 5000
+
+
+def _batch_get_existing_users(postgres_conn, emails, dnis):
+    """Returns dict: user_key (email or dni) -> usuario id. Queries in chunks to avoid huge IN lists."""
+    lookup = {}
+    with postgres_conn.cursor() as cur:
+        for i in range(0, len(emails), LOOKUP_CHUNK):
+            chunk = emails[i : i + LOOKUP_CHUNK]
+            if chunk:
+                cur.execute("SELECT id, email FROM audiencia_usuarios WHERE email = ANY(%s)", (chunk,))
+                for row in cur.fetchall():
+                    lookup[row[1]] = row[0]
+        for i in range(0, len(dnis), LOOKUP_CHUNK):
+            chunk = dnis[i : i + LOOKUP_CHUNK]
+            if chunk:
+                cur.execute("SELECT id, dni FROM audiencia_usuarios WHERE dni = ANY(%s)", (chunk,))
+                for row in cur.fetchall():
+                    if row[1]:
+                        lookup[row[1]] = row[0]
+    return lookup
+
+
+def _batch_insert_users(postgres_conn, users_data):
+    """Multi-row INSERT per batch + RETURNING. Returns dict: user_key -> usuario id."""
+    if not users_data:
+        return {}
+    out = {}
+    with postgres_conn.cursor() as cur:
+        for i in range(0, len(users_data), BATCH_SIZE_USERS):
+            batch = users_data[i : i + BATCH_SIZE_USERS]
+            values = []
+            for u in batch:
+                nc = u.get('nombre_completo') or (f"{u.get('nombre') or ''} {u.get('apellido') or ''}".strip() or None)
+                values.append((
+                    u.get('email'), u.get('dni'), u.get('nombre'), u.get('apellido'),
+                    u.get('pais'), u.get('provincia'), u.get('ciudad'), u.get('telefono'),
+                    u.get('direccion'), u.get('genero'), nc,
+                ))
+            n = len(values)
+            ph = ", ".join(["(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"] * n)
+            cur.execute(
+                f"""INSERT INTO audiencia_usuarios
+                    (email, dni, nombre, apellido, pais, provincia, ciudad, telefono, direccion, genero, nombre_completo)
+                    VALUES {ph} RETURNING id, email, dni""",
+                [v for t in values for v in t],
+            )
+            for row in cur.fetchall():
+                k = row[1] or row[2]
+                if k:
+                    out[k] = row[0]
+            postgres_conn.commit()
+    return out
+
+
+def _batch_upsert_usuario_eventos(postgres_conn, evento_id, records):
+    """One multi-row INSERT ... ON CONFLICT per batch (minimal round-trips)."""
+    if not records:
+        return
+    with postgres_conn.cursor() as cur:
+        for i in range(0, len(records), BATCH_SIZE_USUARIO_EVENTO):
+            batch = records[i : i + BATCH_SIZE_USUARIO_EVENTO]
+            n = len(batch)
+            ph = ", ".join(["(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"] * n)
+            flat = []
+            for r in batch:
+                flat.extend([r[0], evento_id, r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]])
+            cur.execute(
+                f"""INSERT INTO audiencia_usuarios_eventos
+                    (usuario_id, evento_id, cantidad_tickets, gasto_final, promociones, forma_de_pago,
+                     tarjeta, sector, cuotas, dias_de_venta, fecha_de_pago, hora_de_pago)
+                    VALUES {ph}
+                    ON CONFLICT (usuario_id, evento_id) DO UPDATE SET
+                      cantidad_tickets = audiencia_usuarios_eventos.cantidad_tickets + EXCLUDED.cantidad_tickets,
+                      gasto_final = COALESCE(audiencia_usuarios_eventos.gasto_final,0) + COALESCE(EXCLUDED.gasto_final,0),
+                      cuotas = COALESCE(audiencia_usuarios_eventos.cuotas,0) + COALESCE(EXCLUDED.cuotas,0),
+                      dias_de_venta = COALESCE(audiencia_usuarios_eventos.dias_de_venta,0) + COALESCE(EXCLUDED.dias_de_venta,0),
+                      promociones = COALESCE(EXCLUDED.promociones, audiencia_usuarios_eventos.promociones),
+                      forma_de_pago = COALESCE(EXCLUDED.forma_de_pago, audiencia_usuarios_eventos.forma_de_pago),
+                      tarjeta = COALESCE(EXCLUDED.tarjeta, audiencia_usuarios_eventos.tarjeta),
+                      sector = COALESCE(EXCLUDED.sector, audiencia_usuarios_eventos.sector),
+                      fecha_de_pago = COALESCE(EXCLUDED.fecha_de_pago, audiencia_usuarios_eventos.fecha_de_pago),
+                      hora_de_pago = COALESCE(EXCLUDED.hora_de_pago, audiencia_usuarios_eventos.hora_de_pago),
+                      updated_at = NOW()""",
+                flat,
+            )
+            postgres_conn.commit()
+
+
 def process_sheet_data(postgres_conn, sheet_data, artista_nombre, venue, fecha, ticketera):
     """
     Procesa los datos de un sheet e inserta/actualiza en la BD
@@ -680,105 +776,113 @@ def process_sheet_data(postgres_conn, sheet_data, artista_nombre, venue, fecha, 
             col_map['hora_pago'] = idx
         elif 'dias' in header and 'venta' in header:
             col_map['dias_venta'] = idx
-    
-    stats = {
-        'processed': 0,
-        'errors': 0,
-        'created_users': 0,
-        'updated_users': 0
-    }
-    
-    # Procesar filas en batches
-    batch_size = 100
-    rows_to_process = sheet_data[1:]  # Saltar header
-    
-    for i in range(0, len(rows_to_process), batch_size):
-        batch = rows_to_process[i:i+batch_size]
-        
-        for row in batch:
-            try:
-                # Extraer datos de la fila
-                def get_col(key, default=None):
-                    idx = col_map.get(key)
-                    if idx is not None and idx < len(row):
-                        val = row[idx]
-                        return val.strip() if val else default
-                    return default
-                
-                email = get_col('email')
-                dni = get_col('dni')
-                nombre_completo = get_col('nombre_completo')
-                nombre = get_col('nombre')
-                apellido = get_col('apellido')
-                pais = get_col('pais')
-                provincia = get_col('provincia')
-                ciudad = get_col('ciudad')
-                direccion = get_col('direccion')
-                telefono = get_col('telefono')
-                genero = get_col('genero')
-                cantidad_tickets = get_col('cantidad_tickets', '0')
-                monto_str = get_col('monto', '0')
-                promociones = get_col('promociones')
-                forma_de_pago = get_col('forma_de_pago')
-                tarjeta = get_col('tarjeta')
-                sector = get_col('sector')
-                cuotas_str = get_col('cuotas', '0')
-                fecha_pago_str = get_col('fecha_pago')
-                hora_pago_str = get_col('hora_pago')
-                dias_venta_str = get_col('dias_venta', '0')
-                
-                # Parsear valores
-                cantidad_tickets = int(cantidad_tickets) if cantidad_tickets and cantidad_tickets.isdigit() else None
-                gasto_final = parse_monto(monto_str)
-                cuotas = float(cuotas_str) if cuotas_str else None
-                fecha_pago = parse_fecha_pago(fecha_pago_str)
-                hora_pago = parse_hora_pago(hora_pago_str)
-                dias_venta = float(dias_venta_str) if dias_venta_str else None
-                
-                # Si no hay nombre completo, construirlo
-                if not nombre_completo and (nombre or apellido):
-                    nombre_completo = f"{nombre or ''} {apellido or ''}".strip()
-                
-                # Validar que tengamos email o DNI
-                if not email and not dni:
-                    stats['errors'] += 1
-                    continue
-                
-                # Verificar si usuario existe antes de crear/actualizar
-                usuario_existed = False
-                with postgres_conn.cursor() as cur:
-                    if email:
-                        cur.execute("SELECT id FROM audiencia_usuarios WHERE email = %s", (email,))
-                    else:
-                        cur.execute("SELECT id FROM audiencia_usuarios WHERE dni = %s", (dni,))
-                    
-                    result = cur.fetchone()
-                    usuario_existed = result is not None
-                
-                usuario_id = get_or_create_usuario(
-                    postgres_conn, email, dni, nombre, apellido, pais, provincia, ciudad,
-                    telefono, direccion, genero, nombre_completo
-                )
-                
-                if usuario_id:
-                    if usuario_existed:
-                        stats['updated_users'] += 1
-                    else:
-                        stats['created_users'] += 1
-                    
-                    # Crear o actualizar relación usuario-evento
-                    create_or_update_usuario_evento(
-                        postgres_conn, usuario_id, evento_id, cantidad_tickets, gasto_final,
-                        promociones, forma_de_pago, tarjeta, sector, cuotas, dias_venta,
-                        fecha_pago, hora_pago
-                    )
-                    
-                    stats['processed'] += 1
-            except Exception as e:
+
+    def get_col(row, key, default=None):
+        idx = col_map.get(key)
+        if idx is not None and idx < len(row):
+            val = row[idx]
+            return val.strip() if val else default
+        return default
+
+    rows_to_process = sheet_data[1:]
+    stats = {'processed': 0, 'errors': 0, 'created_users': 0, 'updated_users': 0}
+
+    # 1) Parse + aggregate by (email or dni): same person in N rows = sum tickets/monto
+    aggregated = {}
+    for row in rows_to_process:
+        try:
+            email = get_col(row, 'email')
+            dni = get_col(row, 'dni')
+            if not email and not dni:
                 stats['errors'] += 1
-                # Log error pero continuar
                 continue
-    
+            user_key = (email or '').strip() or (dni or '').strip()
+            if not user_key:
+                stats['errors'] += 1
+                continue
+
+            ct = get_col(row, 'cantidad_tickets', '0')
+            ct = int(ct) if ct and ct.isdigit() else None
+            gasto_final = parse_monto(get_col(row, 'monto', '0'))
+            cuotas_str = get_col(row, 'cuotas', '0')
+            cuotas = float(cuotas_str) if cuotas_str else None
+            dv_str = get_col(row, 'dias_venta', '0')
+            dias_venta = float(dv_str) if dv_str else None
+            fecha_pago = parse_fecha_pago(get_col(row, 'fecha_pago'))
+            hora_pago = parse_hora_pago(get_col(row, 'hora_pago'))
+            nombre = get_col(row, 'nombre')
+            apellido = get_col(row, 'apellido')
+            nombre_completo = get_col(row, 'nombre_completo')
+            if not nombre_completo and (nombre or apellido):
+                nombre_completo = f"{nombre or ''} {apellido or ''}".strip()
+
+            if user_key not in aggregated:
+                aggregated[user_key] = {
+                    'email': email or None, 'dni': dni or None,
+                    'nombre': nombre, 'apellido': apellido, 'nombre_completo': nombre_completo or None,
+                    'pais': get_col(row, 'pais'), 'provincia': get_col(row, 'provincia'),
+                    'ciudad': get_col(row, 'ciudad'), 'direccion': get_col(row, 'direccion'),
+                    'telefono': get_col(row, 'telefono'), 'genero': get_col(row, 'genero'),
+                    'cantidad_tickets': ct or 0, 'gasto_final': gasto_final or 0.0,
+                    'cuotas': cuotas or 0.0, 'dias_venta': dias_venta or 0.0,
+                    'promociones': get_col(row, 'promociones'), 'forma_de_pago': get_col(row, 'forma_de_pago'),
+                    'tarjeta': get_col(row, 'tarjeta'), 'sector': get_col(row, 'sector'),
+                    'fecha_pago': fecha_pago, 'hora_pago': hora_pago, 'row_count': 1,
+                }
+            else:
+                agg = aggregated[user_key]
+                agg['cantidad_tickets'] = (agg['cantidad_tickets'] or 0) + (ct or 0)
+                agg['gasto_final'] = (agg['gasto_final'] or 0.0) + (gasto_final or 0.0)
+                agg['cuotas'] = (agg['cuotas'] or 0.0) + (cuotas or 0.0)
+                agg['dias_venta'] = (agg['dias_venta'] or 0.0) + (dias_venta or 0.0)
+                agg['row_count'] += 1
+                agg['promociones'] = get_col(row, 'promociones') or agg['promociones']
+                agg['forma_de_pago'] = get_col(row, 'forma_de_pago') or agg['forma_de_pago']
+                agg['tarjeta'] = get_col(row, 'tarjeta') or agg['tarjeta']
+                agg['sector'] = get_col(row, 'sector') or agg['sector']
+                agg['fecha_pago'] = fecha_pago or agg['fecha_pago']
+                agg['hora_pago'] = hora_pago or agg['hora_pago']
+        except Exception:
+            stats['errors'] += 1
+
+    if not aggregated:
+        return stats
+
+    # 2) Batch lookup existing users (chunked)
+    emails = list({k for k in aggregated if k and '@' in k})
+    dnis = list({k for k in aggregated if k and '@' not in k})
+    existing_ids = _batch_get_existing_users(postgres_conn, emails, dnis)
+
+    # 3) New users: multi-row INSERT per batch
+    new_user_keys = [k for k in aggregated if k not in existing_ids]
+    users_to_insert = []
+    for k in new_user_keys:
+        a = aggregated[k]
+        users_to_insert.append({
+            'email': a['email'], 'dni': a['dni'], 'nombre': a['nombre'], 'apellido': a['apellido'],
+            'nombre_completo': a['nombre_completo'], 'pais': a['pais'], 'provincia': a['provincia'],
+            'ciudad': a['ciudad'], 'telefono': a['telefono'], 'direccion': a['direccion'], 'genero': a['genero'],
+        })
+    new_ids = _batch_insert_users(postgres_conn, users_to_insert) if users_to_insert else {}
+
+    # 4) Full user_id map
+    user_id_map = {**existing_ids, **new_ids}
+    stats['created_users'] = len(new_ids)
+    stats['updated_users'] = len([k for k in aggregated if k in existing_ids])
+
+    # 5) Batch upsert usuario_evento (one multi-row INSERT per batch)
+    records = []
+    for user_key, a in aggregated.items():
+        uid = user_id_map.get(user_key)
+        if not uid:
+            continue
+        records.append((
+            uid, a['cantidad_tickets'], a['gasto_final'], a['promociones'], a['forma_de_pago'],
+            a['tarjeta'], a['sector'], a['cuotas'], a['dias_venta'], a['fecha_pago'], a['hora_pago'],
+        ))
+    _batch_upsert_usuario_eventos(postgres_conn, evento_id, records)
+
+    stats['processed'] = sum(a['row_count'] for a in aggregated.values())
     return stats
 
 def load_processed_sheets_state():
@@ -998,22 +1102,12 @@ def main():
     state = load_processed_sheets_state()
     processed_sheet_ids = set(state.get('processed_sheet_ids', []))
     
-    # Filtrar solo sheets nuevos (que no han sido procesados)
+    # Sheets que nunca se procesaron (solo informativo)
     new_sheets = [sheet for sheet in sheets if sheet['id'] not in processed_sheet_ids]
     
-    if not new_sheets:
-        console.print(Panel.fit(
-            "[bold green]✅ No hay sheets nuevos para procesar.[/bold green]\n"
-            f"[dim]Total sheets en carpeta: {len(sheets)}[/dim]\n"
-            f"[dim]Sheets ya procesados: {len(processed_sheet_ids)}[/dim]",
-            style="green",
-            border_style="green"
-        ))
-        return
-    
     console.print(Panel.fit(
-        f"[bold cyan]📋 Sheets nuevos encontrados: [yellow]{len(new_sheets)}[/yellow][/bold cyan]\n"
-        f"[dim]Total en carpeta: {len(sheets)} | Ya procesados: {len(processed_sheet_ids)}[/dim]",
+        f"[bold cyan]📋 Sheets en carpeta: [yellow]{len(sheets)}[/yellow][/bold cyan]\n"
+        f"[dim]Nunca procesados: {len(new_sheets)} | Ya procesados (histórico): {len(processed_sheet_ids)}[/dim]",
         style="cyan",
         border_style="cyan"
     ))
@@ -1109,17 +1203,16 @@ def main():
         console.print(Rule(style="dim"))
         console.print()
         
-        # Filtrar solo los sheets que NO están en BD Y que son nuevos
+        # Procesar TODOS los sheets que NO están en BD (aunque ya se hayan intentado antes)
         if db_events is not None and comparison['sheets_not_in_db']:
-            # Crear un diccionario con los sheet_ids que no están en BD
             sheets_not_in_db_ids = {sheet_event['sheet_id'] for sheet_event in comparison['sheets_not_in_db']}
-            # Filtrar sheets nuevos que no están en BD
-            sheets_to_process = [sheet for sheet in new_sheets if sheet['id'] in sheets_not_in_db_ids]
+            # Usar lista completa de sheets de Drive, no solo "nuevos": así se procesan los 2 (o N) que no están en BD
+            sheets_to_process = [sheet for sheet in sheets if sheet['id'] in sheets_not_in_db_ids]
             
             if not sheets_to_process:
                 console.print(Panel.fit(
-                    "[bold green]✅ No hay sheets nuevos que procesar.[/bold green]\n"
-                    "[dim]Todos los sheets nuevos ya están en la Base de Datos.[/dim]",
+                    "[bold green]✅ No hay sheets que procesar.[/bold green]\n"
+                    "[dim]Todos los sheets están en la Base de Datos.[/dim]",
                     style="green",
                     border_style="green"
                 ))
