@@ -644,7 +644,7 @@ def _batch_get_existing_users(postgres_conn, emails, dnis):
 
 
 def _batch_insert_users(postgres_conn, users_data):
-    """Multi-row INSERT per batch. ON CONFLICT (email) DO NOTHING so existing users are skipped; RETURNING + fallback lookup returns all ids."""
+    """Multi-row INSERT per batch. ON CONFLICT ON CONSTRAINT uq_audiencia_usuarios_email DO NOTHING so existing users are skipped; RETURNING + fallback lookup returns all ids."""
     if not users_data:
         return {}
     out = {}
@@ -666,7 +666,7 @@ def _batch_insert_users(postgres_conn, users_data):
                 f"""INSERT INTO audiencia_usuarios
                     (email, dni, nombre, apellido, pais, provincia, ciudad, telefono, direccion, genero, nombre_completo)
                     VALUES {ph}
-                    ON CONFLICT (email) DO NOTHING
+                    ON CONFLICT ON CONSTRAINT uq_audiencia_usuarios_email DO NOTHING
                     RETURNING id, email, dni""",
                 [v for t in values for v in t],
             )
