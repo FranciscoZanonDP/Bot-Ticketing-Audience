@@ -644,14 +644,13 @@ def _batch_get_existing_users(postgres_conn, emails, dnis):
 
 
 def _batch_insert_users(postgres_conn, users_data):
-    """Multi-row INSERT per batch. ON CONFLICT ON CONSTRAINT uq_audiencia_usuarios_email DO NOTHING so existing users are skipped; RETURNING + fallback lookup returns all ids."""
+    """Multi-row INSERT per batch. RETURNING id. Duplicates avoided by case-insensitive lookup before insert."""
     if not users_data:
         return {}
     out = {}
     with postgres_conn.cursor() as cur:
         for i in range(0, len(users_data), BATCH_SIZE_USERS):
             batch = users_data[i : i + BATCH_SIZE_USERS]
-            batch_keys = [u.get('email') or u.get('dni') for u in batch]
             values = []
             for u in batch:
                 nc = u.get('nombre_completo') or (f"{u.get('nombre') or ''} {u.get('apellido') or ''}".strip() or None)
@@ -666,7 +665,6 @@ def _batch_insert_users(postgres_conn, users_data):
                 f"""INSERT INTO audiencia_usuarios
                     (email, dni, nombre, apellido, pais, provincia, ciudad, telefono, direccion, genero, nombre_completo)
                     VALUES {ph}
-                    ON CONFLICT ON CONSTRAINT uq_audiencia_usuarios_email DO NOTHING
                     RETURNING id, email, dni""",
                 [v for t in values for v in t],
             )
@@ -674,25 +672,6 @@ def _batch_insert_users(postgres_conn, users_data):
                 k = row[1] or row[2]
                 if k:
                     out[k] = row[0]
-            missing_keys = [k for k in batch_keys if k and k not in out]
-            if missing_keys:
-                emails_missing = [m for m in missing_keys if m and "@" in m]
-                dnis_missing = [m for m in missing_keys if m and "@" not in m]
-                if emails_missing:
-                    cur.execute(
-                        "SELECT id, email FROM audiencia_usuarios WHERE LOWER(email) = ANY(%s)",
-                        ([e.lower() for e in emails_missing],),
-                    )
-                    for row in cur.fetchall():
-                        uid, db_email = row[0], row[1]
-                        for k in emails_missing:
-                            if k and k.lower() == (db_email or "").lower():
-                                out[k] = uid
-                if dnis_missing:
-                    cur.execute("SELECT id, dni FROM audiencia_usuarios WHERE dni = ANY(%s)", (dnis_missing,))
-                    for row in cur.fetchall():
-                        if row[1]:
-                            out[row[1]] = row[0]
             postgres_conn.commit()
     return out
 
