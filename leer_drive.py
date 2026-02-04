@@ -619,15 +619,20 @@ LOOKUP_CHUNK = 5000
 
 
 def _batch_get_existing_users(postgres_conn, emails, dnis):
-    """Returns dict: user_key (email or dni) -> usuario id. Queries in chunks to avoid huge IN lists."""
+    """Returns dict: user_key (email or dni) -> usuario id. Case-insensitive on email so sheet casing matches DB."""
     lookup = {}
     with postgres_conn.cursor() as cur:
         for i in range(0, len(emails), LOOKUP_CHUNK):
             chunk = emails[i : i + LOOKUP_CHUNK]
             if chunk:
-                cur.execute("SELECT id, email FROM audiencia_usuarios WHERE email = ANY(%s)", (chunk,))
+                chunk_lower = [e.lower() for e in chunk]
+                cur.execute("SELECT id, email FROM audiencia_usuarios WHERE LOWER(email) = ANY(%s)", (chunk_lower,))
                 for row in cur.fetchall():
-                    lookup[row[1]] = row[0]
+                    uid, db_email = row[0], row[1]
+                    lookup[db_email] = uid
+                    for e in chunk:
+                        if e and e.lower() == (db_email or "").lower():
+                            lookup[e] = uid
         for i in range(0, len(dnis), LOOKUP_CHUNK):
             chunk = dnis[i : i + LOOKUP_CHUNK]
             if chunk:
@@ -639,13 +644,14 @@ def _batch_get_existing_users(postgres_conn, emails, dnis):
 
 
 def _batch_insert_users(postgres_conn, users_data):
-    """Multi-row INSERT per batch + RETURNING. Returns dict: user_key -> usuario id."""
+    """Multi-row INSERT per batch. ON CONFLICT (email) DO NOTHING so existing users are skipped; RETURNING + fallback lookup returns all ids."""
     if not users_data:
         return {}
     out = {}
     with postgres_conn.cursor() as cur:
         for i in range(0, len(users_data), BATCH_SIZE_USERS):
             batch = users_data[i : i + BATCH_SIZE_USERS]
+            batch_keys = [u.get('email') or u.get('dni') for u in batch]
             values = []
             for u in batch:
                 nc = u.get('nombre_completo') or (f"{u.get('nombre') or ''} {u.get('apellido') or ''}".strip() or None)
@@ -659,13 +665,34 @@ def _batch_insert_users(postgres_conn, users_data):
             cur.execute(
                 f"""INSERT INTO audiencia_usuarios
                     (email, dni, nombre, apellido, pais, provincia, ciudad, telefono, direccion, genero, nombre_completo)
-                    VALUES {ph} RETURNING id, email, dni""",
+                    VALUES {ph}
+                    ON CONFLICT (email) DO NOTHING
+                    RETURNING id, email, dni""",
                 [v for t in values for v in t],
             )
             for row in cur.fetchall():
                 k = row[1] or row[2]
                 if k:
                     out[k] = row[0]
+            missing_keys = [k for k in batch_keys if k and k not in out]
+            if missing_keys:
+                emails_missing = [m for m in missing_keys if m and "@" in m]
+                dnis_missing = [m for m in missing_keys if m and "@" not in m]
+                if emails_missing:
+                    cur.execute(
+                        "SELECT id, email FROM audiencia_usuarios WHERE LOWER(email) = ANY(%s)",
+                        ([e.lower() for e in emails_missing],),
+                    )
+                    for row in cur.fetchall():
+                        uid, db_email = row[0], row[1]
+                        for k in emails_missing:
+                            if k and k.lower() == (db_email or "").lower():
+                                out[k] = uid
+                if dnis_missing:
+                    cur.execute("SELECT id, dni FROM audiencia_usuarios WHERE dni = ANY(%s)", (dnis_missing,))
+                    for row in cur.fetchall():
+                        if row[1]:
+                            out[row[1]] = row[0]
             postgres_conn.commit()
     return out
 
@@ -1343,6 +1370,11 @@ def main():
                 successfully_processed_ids.append(sheet_id)
                 
             except Exception as e:
+                if postgres_conn:
+                    try:
+                        postgres_conn.rollback()
+                    except Exception:
+                        pass
                 progress.update(task, description="[red]❌ Error procesando datos")
                 console.print()
                 console.print(Panel.fit(
