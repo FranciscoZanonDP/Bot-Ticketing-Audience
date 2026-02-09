@@ -807,8 +807,8 @@ def process_sheet_data(postgres_conn, sheet_data, artista_nombre, venue, fecha, 
                 stats['errors'] += 1
                 continue
 
-            ct = get_col(row, 'cantidad_tickets', '0')
-            ct = int(ct) if ct and ct.isdigit() else None
+            ct_str = get_col(row, 'cantidad_tickets', '1')
+            ct = int(ct_str) if ct_str and str(ct_str).strip().isdigit() else 1
             gasto_final = parse_monto(get_col(row, 'monto', '0'))
             cuotas_str = get_col(row, 'cuotas', '0')
             cuotas = float(cuotas_str) if cuotas_str else None
@@ -829,7 +829,7 @@ def process_sheet_data(postgres_conn, sheet_data, artista_nombre, venue, fecha, 
                     'pais': get_col(row, 'pais'), 'provincia': get_col(row, 'provincia'),
                     'ciudad': get_col(row, 'ciudad'), 'direccion': get_col(row, 'direccion'),
                     'telefono': get_col(row, 'telefono'), 'genero': get_col(row, 'genero'),
-                    'cantidad_tickets': ct or 0, 'gasto_final': gasto_final or 0.0,
+                    'cantidad_tickets': ct, 'gasto_final': gasto_final or 0.0,
                     'cuotas': cuotas or 0.0, 'dias_venta': dias_venta or 0.0,
                     'promociones': get_col(row, 'promociones'), 'forma_de_pago': get_col(row, 'forma_de_pago'),
                     'tarjeta': get_col(row, 'tarjeta'), 'sector': get_col(row, 'sector'),
@@ -837,7 +837,7 @@ def process_sheet_data(postgres_conn, sheet_data, artista_nombre, venue, fecha, 
                 }
             else:
                 agg = aggregated[user_key]
-                agg['cantidad_tickets'] = (agg['cantidad_tickets'] or 0) + (ct or 0)
+                agg['cantidad_tickets'] = (agg['cantidad_tickets'] or 0) + ct
                 agg['gasto_final'] = (agg['gasto_final'] or 0.0) + (gasto_final or 0.0)
                 agg['cuotas'] = (agg['cuotas'] or 0.0) + (cuotas or 0.0)
                 agg['dias_venta'] = (agg['dias_venta'] or 0.0) + (dias_venta or 0.0)
